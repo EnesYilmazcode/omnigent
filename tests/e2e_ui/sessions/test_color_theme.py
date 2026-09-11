@@ -3,8 +3,8 @@
 Alongside the light/dark **mode** tiles, ``AppearanceSection``
 (``pages/SettingsPage.tsx``) renders a "Color theme" dropdown (a shadcn
 ``Select``) — one option per palette (Omnigent, Dracula, GitHub, Catppuccin,
-Gruvbox, Nord). Choosing one calls ``applyThemePalette`` (``lib/themePalette.ts``),
-which sets ``data-theme`` on ``<html>`` and persists the id to
+Gruvbox, Solarized, Nord). Choosing one calls ``applyThemePalette``
+(``lib/themePalette.ts``), which sets ``data-theme`` on ``<html>`` and persists the id to
 ``localStorage["omnigent:ui-theme-palette"]``. The default "Omnigent" palette
 carries no override, so choosing it removes the attribute and clears the key.
 
@@ -44,6 +44,151 @@ def _html_has_dark(page: Page) -> bool:
     return page.evaluate("() => document.documentElement.classList.contains('dark')")
 
 
+def _computed_theme_tokens(page: Page) -> dict[str, str]:
+    names = [
+        "background",
+        "card",
+        "sidebar",
+        "border",
+        "ring",
+        "brand-accent",
+        "sidebar-active",
+        "sidebar-active-foreground",
+        "foreground",
+        "card-solid",
+        "card-foreground",
+        "tray",
+        "popover",
+        "popover-foreground",
+        "primary",
+        "primary-foreground",
+        "selection-background",
+        "selection-foreground",
+        "secondary",
+        "secondary-foreground",
+        "muted",
+        "muted-foreground",
+        "code-bg",
+        "accent",
+        "accent-foreground",
+        "border-strong",
+        "button-border",
+        "input",
+        "sidebar-foreground",
+        "sidebar-primary",
+        "sidebar-primary-foreground",
+        "sidebar-accent",
+        "sidebar-accent-foreground",
+        "sidebar-border",
+        "sidebar-ring",
+    ]
+    colors = page.evaluate(
+        "names => { const probe = document.createElement('div'); "
+        "const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1; "
+        "const context = canvas.getContext('2d'); document.body.append(probe); "
+        "const values = Object.fromEntries(names.map(name => { "
+        "probe.style.color = `var(--${name})`; context.clearRect(0, 0, 1, 1); "
+        "context.fillStyle = getComputedStyle(probe).color; context.fillRect(0, 0, 1, 1); "
+        "return [name, Array.from(context.getImageData(0, 0, 1, 1).data).join(',')]; "
+        "})); probe.remove(); return values; }",
+        names,
+    )
+    backgrounds = page.evaluate(
+        "() => Object.fromEntries([['shell', document.querySelector('.app-shell')], "
+        "['conversation-sidebar', document.querySelector('.conversations-sidebar')]]"
+        ".map(([name, element]) => { const style = getComputedStyle(element); "
+        "return [name, `${style.backgroundColor}|${style.backgroundImage}`]; }))"
+    )
+    return {**colors, **backgrounds}
+
+
+def _set_contrast(page: Page, value: int) -> None:
+    page.get_by_test_id("custom-theme-contrast").evaluate(
+        "(element, next) => { "
+        "const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set; "
+        "setter.call(element, String(next)); "
+        "element.dispatchEvent(new Event('input', { bubbles: true })); "
+        "}",
+        value,
+    )
+
+
+def _text_selection_contrast(page: Page) -> list[dict[str, str | float]]:
+    return page.evaluate(
+        """() => {
+            const canvas = document.createElement('canvas');
+            canvas.width = canvas.height = 1;
+            const context = canvas.getContext('2d');
+            const probe = document.createElement('div');
+            document.body.append(probe);
+            const rgba = (color, background) => {
+                context.clearRect(0, 0, 1, 1);
+                if (background) {
+                    context.fillStyle = background;
+                    context.fillRect(0, 0, 1, 1);
+                }
+                context.fillStyle = color;
+                context.fillRect(0, 0, 1, 1);
+                return Array.from(context.getImageData(0, 0, 1, 1).data);
+            };
+            const luminance = (color) => {
+                const channels = color.slice(0, 3).map(channel => {
+                    const value = channel / 255;
+                    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+                });
+                return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+            };
+            const ratio = (first, second) => {
+                const firstLuminance = luminance(first);
+                const secondLuminance = luminance(second);
+                return (Math.max(firstLuminance, secondLuminance) + 0.05)
+                    / (Math.min(firstLuminance, secondLuminance) + 0.05);
+            };
+            probe.style.backgroundColor = 'var(--background)';
+            const background = getComputedStyle(probe).backgroundColor;
+            try {
+                return ['background', 'card', 'card-solid', 'muted', 'code-bg', 'sidebar']
+                    .flatMap(surface => {
+                        probe.style.backgroundColor = `var(--${surface})`;
+                        const surfaceColor = rgba(
+                            getComputedStyle(probe).backgroundColor, background,
+                        );
+                        return ['span', 'a', 'code', 'textarea'].map(tag => {
+                            const text = document.createElement(tag);
+                            text.textContent = 'Select this text';
+                            text.style.color = 'var(--primary)';
+                            probe.append(text);
+                            const selection = window.getSelection();
+                            if (tag === 'textarea') {
+                                text.focus();
+                                text.select();
+                            } else {
+                                const range = document.createRange();
+                                range.selectNodeContents(text);
+                                selection.removeAllRanges();
+                                selection.addRange(range);
+                            }
+                            const style = getComputedStyle(text, '::selection');
+                            const selectedBackground = rgba(style.backgroundColor);
+                            const selectedForeground = rgba(style.color);
+                            const result = {
+                                surface: `${surface}/${tag}`,
+                                alpha: selectedBackground[3],
+                                textContrast: ratio(selectedForeground, selectedBackground),
+                                surfaceContrast: ratio(selectedBackground, surfaceColor),
+                            };
+                            text.remove();
+                            return result;
+                        });
+                    });
+            } finally {
+                window.getSelection().removeAllRanges();
+                probe.remove();
+            }
+        }"""
+    )
+
+
 def _theme_radiogroup(page: Page) -> Locator:
     """The appearance-mode radiogroup ("Mode"). Matched exactly so it can't also
     resolve the "Color theme" / "Terminal theme" radiogroups, whose cards reuse
@@ -60,6 +205,15 @@ def _pick_palette(page: Page, name: str) -> None:
     """Open the color-theme dropdown and choose the option with the given name."""
     _color_theme_select(page).click()
     page.get_by_role("option", name=name).click()
+
+
+def _preset_palette_names(page: Page) -> list[str]:
+    _color_theme_select(page).click()
+    options = page.locator('[data-testid^="palette-"]:not([data-testid="palette-custom"])')
+    expect(options.first).to_be_visible()
+    names = [name.strip() for name in options.all_inner_texts()]
+    page.keyboard.press("Escape")
+    return names
 
 
 def _open_appearance(page: Page, base_url: str) -> None:
@@ -134,6 +288,36 @@ def test_color_palette_composes_with_dark_mode(
     assert _html_has_dark(page), "dark class missing — the palette should compose with dark mode"
 
 
+def test_solarized_dark_uses_canonical_canvas(page: Page, seeded_session: tuple[str, str]) -> None:
+    """Solarized is selectable and applies its canonical dark surface colors."""
+    page.emulate_media(color_scheme="light")
+    base_url, _session_id = seeded_session
+    _open_appearance(page, base_url)
+
+    _pick_palette(page, "Solarized")
+    dark = _theme_radiogroup(page).get_by_role("radio", name="Dark")
+    dark.click()
+    expect(dark).to_have_attribute("aria-checked", "true")
+
+    assert _data_theme(page) == "solarized"
+    assert _stored_palette(page) == '"solarized"'
+    tokens = page.evaluate(
+        "() => { const style = getComputedStyle(document.documentElement); "
+        "return Object.fromEntries(['background', 'card', 'primary'].map(name => "
+        "[name, style.getPropertyValue(`--${name}`).trim()])); }"
+    )
+    assert tokens == {
+        "background": "#002b36",
+        "card": "#073642",
+        "primary": "#268bd2",
+    }
+
+    page.reload()
+    expect(_color_theme_select(page)).to_contain_text("Solarized")
+    assert _data_theme(page) == "solarized"
+    assert _html_has_dark(page)
+
+
 def test_guided_custom_theme_applies_to_both_modes_and_persists(
     page: Page, seeded_session: tuple[str, str]
 ) -> None:
@@ -145,7 +329,7 @@ def test_guided_custom_theme_applies_to_both_modes_and_persists(
     _pick_palette(page, "GitHub")
     page.get_by_test_id("custom-theme-accent-trigger").click()
     accent = page.get_by_test_id("custom-theme-accent-input")
-    expect(accent).to_have_value("#0969DA")
+    expect(accent).to_have_value("#1F883D")
     accent.fill("#2563eb")
 
     expect(_color_theme_select(page)).to_contain_text("Custom")
@@ -173,6 +357,7 @@ def test_guided_custom_theme_applies_to_both_modes_and_persists(
         ".getPropertyValue('--custom-dark-background').trim()"
     )
     assert light_background and dark_background and light_background != dark_background
+    assert dark_background == "#0d1117"
 
     dark = _theme_radiogroup(page).get_by_role("radio", name="Dark")
     dark.click()
@@ -199,6 +384,47 @@ def test_guided_custom_theme_applies_to_both_modes_and_persists(
     assert surface_background == "rgba(0, 0, 0, 0)", (
         "workspace content should not cover the translucent rail"
     )
+
+
+def test_contrast_round_trip_restores_preset_tokens(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    page.emulate_media(color_scheme="light")
+    base_url, _session_id = seeded_session
+    _open_appearance(page, base_url)
+
+    for mode in ["Light", "Dark"]:
+        _theme_radiogroup(page).get_by_role("radio", name=mode).click()
+        for palette in _preset_palette_names(page):
+            _pick_palette(page, palette)
+            before = _computed_theme_tokens(page)
+            _set_contrast(page, 53)
+            _set_contrast(page, 50)
+
+            expect(_color_theme_select(page)).to_contain_text("Custom")
+            assert _computed_theme_tokens(page) == before, f"{mode} {palette} did not round-trip"
+
+
+def test_text_selection_stands_out_in_every_palette(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    page.emulate_media(color_scheme="light")
+    base_url, _session_id = seeded_session
+    _open_appearance(page, base_url)
+
+    for mode in ["Light", "Dark"]:
+        _theme_radiogroup(page).get_by_role("radio", name=mode).click()
+        for palette in _preset_palette_names(page):
+            _pick_palette(page, palette)
+            for custom in [False, True]:
+                if custom:
+                    _set_contrast(page, 100)
+                    expect(_color_theme_select(page)).to_contain_text("Custom")
+                for result in _text_selection_contrast(page):
+                    context = f"{mode} {palette} custom={custom} {result['surface']}: {result}"
+                    assert result["alpha"] == 255, context
+                    assert result["textContrast"] >= 4.5, context
+                    assert result["surfaceContrast"] >= 3, context
 
 
 def test_custom_theme_colors_can_be_randomized(

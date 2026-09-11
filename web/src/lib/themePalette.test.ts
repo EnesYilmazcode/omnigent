@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { setEmbedRoot, setEmbedScopeRoot } from "./host";
 import {
   applyThemePalette,
   DEFAULT_PALETTE,
@@ -15,6 +16,8 @@ const STORAGE_KEY = "omnigent:ui-theme-palette";
 
 afterEach(() => {
   localStorage.clear();
+  setEmbedScopeRoot(null);
+  setEmbedRoot(null);
   document.documentElement.removeAttribute("data-theme");
 });
 
@@ -60,6 +63,7 @@ describe("themePalette", () => {
     expect(isThemePalette("github")).toBe(true);
     expect(isThemePalette("omni")).toBe(true);
     expect(isThemePalette("nord")).toBe(true);
+    expect(isThemePalette("solarized")).toBe(true);
     expect(isThemePalette("nope")).toBe(false);
     expect(isThemePalette(undefined)).toBe(false);
     expect(isThemePalette(42)).toBe(false);
@@ -86,6 +90,22 @@ describe("themePalette", () => {
     expect(document.documentElement.hasAttribute("data-theme")).toBe(false);
   });
 
+  it("stamps data-theme on both embed roots when embedded (light + dark selectors)", () => {
+    // The light `:root[data-theme]` selectors match the scope root; the dark
+    // `.dark[data-theme]` selectors match the inner `.dark` root — both need it.
+    const scope = document.createElement("div");
+    const inner = document.createElement("div");
+    setEmbedScopeRoot(scope);
+    setEmbedRoot(inner);
+    applyThemePalette("dracula");
+    expect(scope.getAttribute("data-theme")).toBe("dracula");
+    expect(inner.getAttribute("data-theme")).toBe("dracula");
+    expect(document.documentElement.hasAttribute("data-theme")).toBe(false);
+    applyThemePalette(DEFAULT_PALETTE);
+    expect(scope.hasAttribute("data-theme")).toBe(false);
+    expect(inner.hasAttribute("data-theme")).toBe(false);
+  });
+
   it("exposes swatch metadata for every selectable palette, default first", () => {
     // The picker renders one card per palette, so the metadata list and the id
     // union must stay in lockstep.
@@ -96,6 +116,36 @@ describe("themePalette", () => {
       expect(palette.label.length).toBeGreaterThan(0);
       expect(palette.light.bg).toMatch(/^#|rgb/);
       expect(palette.dark.bg).toMatch(/^#|rgb/);
+      expect(palette.tokens.light.shellBackground.length).toBeGreaterThan(0);
+      expect(palette.tokens.dark.shellBackground.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("uses the canonical Solarized backgrounds", () => {
+    const solarized = PALETTES.find((palette) => palette.id === "solarized");
+    expect(solarized?.tokens.light.background).toBe("#fdf6e3");
+    expect(solarized?.tokens.dark.background).toBe("#002b36");
+    expect(solarized?.tokens.dark.shellBackground).toBe("#002b36");
+  });
+
+  it.each(PALETTES)("keeps $label selected text opaque and readable in both modes", (palette) => {
+    const luminance = (hex: string) => {
+      const channels = [1, 3, 5].map((offset) => {
+        const value = Number.parseInt(hex.slice(offset, offset + 2), 16) / 255;
+        return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+      });
+      return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+    };
+
+    for (const mode of ["light", "dark"] as const) {
+      const { selectionBackground, selectionForeground } = palette.tokens[mode];
+      expect(selectionBackground).toMatch(/^#[0-9a-f]{6}$/i);
+      expect(selectionForeground).toMatch(/^#[0-9a-f]{6}$/i);
+      const background = luminance(selectionBackground);
+      const foreground = luminance(selectionForeground);
+      const contrast =
+        (Math.max(background, foreground) + 0.05) / (Math.min(background, foreground) + 0.05);
+      expect(contrast, `${palette.label} ${mode}`).toBeGreaterThanOrEqual(4.5);
     }
   });
 });
