@@ -8357,7 +8357,7 @@ def run(
         model = _global_cfg.get("model")
     if harness is None and not direct_server_cli:
         from omnigent.harness_startup_config import resolve_harness_config
-        from omnigent.native_coding_agents import native_coding_agent_for_harness
+        from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 
         harness_default, _ = resolve_harness_config(_global_cfg)
         # A ``*-native`` default names the TUI a bare ``run`` opens, and the TUI
