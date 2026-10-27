@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import json
 import math
 import os
 import secrets
 import sys
+import threading
 import time
+import types
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    CLAUDE_FRAMEWORK_CONTEXT_FILE,
     approval_wait_marker_path,
     hold_approval_wait_marker,
     read_active_session_id,
@@ -61,6 +65,9 @@ _PERMISSION_RETRY_MAX_BACKOFF_S = 30.0
 # Fail unreachable-server connects fast into the backoff loop instead
 # of inheriting the day-long read budget.
 _PERMISSION_CONNECT_TIMEOUT_S = 30.0
+# Re-POST a silent held poll just past the gateway's 300s idle cut: after a
+# host network outage the gateway's reply never arrives and the socket is dead.
+_PERMISSION_POLL_READ_TIMEOUT_S = 330.0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -192,11 +199,17 @@ def main(argv: list[str] | None = None) -> int:
     if raw_argv and raw_argv[0] == "permission-request":
         return _main_permission_request(raw_argv[1:])
     if raw_argv and raw_argv[0] == "ask-user-question":
-        return _main_ask_user_question(raw_argv[1:])
+        # Retired PreToolUse forwarder: settings written before the upgrade
+        # still name it until the terminal restarts. Exit 0 with no output so
+        # Claude proceeds to the PermissionRequest hook. Remove in 0.16.0.
+        sys.stdin.read()
+        return 0
     if raw_argv and raw_argv[0] == "evaluate-policy":
         return _main_evaluate_policy(raw_argv[1:])
     if raw_argv and raw_argv[0] == "route-turn":
         return _main_route_turn(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "framework-context":
+        return _main_framework_context(raw_argv[1:])
     # Backwards compat: older bridge dirs may still reference the
     # pre-tool-use subcommand before the terminal is restarted.
     if raw_argv and raw_argv[0] == "pre-tool-use":
@@ -212,6 +225,12 @@ def main(argv: list[str] | None = None) -> int:
         print("omnigent claude hook: expected JSON object", file=sys.stderr)
         return 0
     bridge_dir = Path(args.bridge_dir)
+    from omnigent.harnesses.claude_native.lifecycle import record_hook_lifecycle
+
+    record_hook_lifecycle(bridge_dir, payload, time.time())
+    if payload.get("hook_event_name") == "SessionEnd":
+        # SessionEnd is diagnostic evidence, not a status or transcript change.
+        return 0
     _annotate_resume_session_context(bridge_dir, payload)
     if payload.get("hook_event_name") == "SessionStart" and payload.get("source") == "clear":
         rotated_session_id = _rotate_session_on_clear(bridge_dir)
@@ -689,7 +708,9 @@ def _post_hook_with_reattach(
       :data:`_PERMISSION_HELD_POLL_FLOOR_S`, or a connection that never
       established (:func:`_never_connected_errors`), or an established
       connection that dropped in under the floor (a flapping/crash-looping
-      server). This is the spin.
+      server). This is the spin. Exception: once a poll has been held, a
+      connect that never reaches the server (a host network outage) backs
+      off without counting, so the card re-parks when the network returns.
     * **Held-poll sever → reset the counter and the backoff.** An established
       connection that dropped mid-poll after being held ≥ the floor, or a
       gateway 5xx (the Databricks front door answers an idle long-poll with
@@ -734,14 +755,15 @@ def _post_hook_with_reattach(
     :param payload: Hook payload to POST. Not mutated; the re-attach id
         rides on a copy.
     :param hook_label: Diagnostic prefix for stderr lines, e.g.
-        ``"permission"`` or ``"ask-user-question"``.
+        ``"claude permission"``.
     :param reauth: Optional callable that re-mints fresh auth headers when the
         server bounces the POST to its OAuth login flow (Apps 302→``/oidc/``)
         or returns ``401`` — i.e. the one-shot ``ap_auth_headers`` token lapsed.
         Called at most once per accepted poll: new headers trigger an immediate
         retry, and a poll the server then held past the floor re-arms it, so a
-        wait longer than the token lifetime survives every lapse while two
-        rejections in a row still fail-ask. ``None`` keeps the legacy behavior.
+        wait longer than the token lifetime survives every lapse. Two rejections
+        in a row fail-ask until a poll has been held; after that, the hook keeps
+        retrying until the deadline. ``None`` keeps the legacy behavior.
     :param wait_marker: Approval-wait marker held fresh for the life of the
         wait (see :func:`hold_approval_wait_marker`), from
         :func:`approval_wait_marker_path`, so the idle pane reaper spares a
@@ -759,13 +781,20 @@ def _post_hook_with_reattach(
 
     from omnigent.native.native_policy_hook import _is_login_redirect_or_unauthorized
 
-    timeout = httpx.Timeout(_PERMISSION_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
+    timeout = httpx.Timeout(
+        _PERMISSION_TIMEOUT_S,
+        connect=_PERMISSION_CONNECT_TIMEOUT_S,
+        read=_PERMISSION_POLL_READ_TIMEOUT_S,
+    )
     # Absolute backstop: even a run of held-poll severs (which don't count
     # toward the hard-failure cap) can't loop past the day-long human-answer
     # window — matches the read budget and the server's ask_timeout.
     deadline = time.monotonic() + _PERMISSION_TIMEOUT_S
     reauthed = False
     consecutive_hard_failures = 0
+    # Once the server has held a poll, the card is live: ride out a network
+    # outage until the deadline so the re-POST re-publishes it on reconnect.
+    parked = False
     marker_scope = (
         hold_approval_wait_marker(wait_marker)
         if wait_marker is not None
@@ -774,6 +803,7 @@ def _post_hook_with_reattach(
     with marker_scope:
         while True:
             attempt_started = time.monotonic()
+            never_connected = False
             try:
                 with httpx.Client(headers=headers, timeout=timeout) as client:
                     resp = client.post(url, json=body)
@@ -799,6 +829,28 @@ def _post_hook_with_reattach(
                     resp.raise_for_status()
                     return resp
             except httpx.HTTPStatusError as exc:
+                if (
+                    reauth is not None
+                    and parked
+                    and _is_login_redirect_or_unauthorized(exc.response)
+                ):
+                    # A parked prompt may outlive login; retry reauth until its deadline.
+                    print(
+                        f"omnigent {hook_label} hook: Omnigent auth lapsed and "
+                        f"could not be renewed; retrying: {exc}",
+                        file=sys.stderr,
+                    )
+                    reauthed = False
+                    time.sleep(backoff_s)
+                    backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)
+                    if time.monotonic() >= deadline:
+                        print(
+                            f"omnigent {hook_label} hook: retry budget exhausted "
+                            f"({_PERMISSION_TIMEOUT_S:.0f}s) — failing ask",
+                            file=sys.stderr,
+                        )
+                        return None
+                    continue
                 if exc.response.status_code < 500:
                     print(
                         f"omnigent {hook_label} hook: Omnigent request rejected: {exc}",
@@ -836,8 +888,12 @@ def _post_hook_with_reattach(
                     file=sys.stderr,
                 )
             if is_hard_failure:
-                consecutive_hard_failures += 1
+                # A connect that never reached the server cannot spin it, so a
+                # parked wait keeps backing off without counting toward the cap.
+                if not (parked and never_connected):
+                    consecutive_hard_failures += 1
             else:
+                parked = True
                 # A proxy severed a genuinely-held poll — the re-park mechanism
                 # working as intended. Reset so a slow human is never capped, and
                 # re-POST promptly so the same id re-parks inside the server's
@@ -931,113 +987,18 @@ def _main_permission_request(argv: list[str]) -> int:
     return 0
 
 
-def _main_ask_user_question(argv: list[str]) -> int:
+def _skip_httpx_cli_import() -> None:
     """
-    Handle a ``PreToolUse`` hook for Claude's built-in ``AskUserQuestion`` tool.
+    Keep httpx from importing its command-line client, and with it rich and click.
 
-    In ``bypassPermissions`` mode the ``PermissionRequest`` hook never fires,
-    so ``AskUserQuestion`` questions are silently swallowed — the web UI never
-    sees them. This handler intercepts the tool via ``PreToolUse`` (which fires
-    in all permission modes), POSTs the same payload to the Omnigent server's
-    ``/hooks/permission-request`` endpoint, waits for the user's web-UI answer,
-    and converts the ``PermissionRequest``-format response into a
-    ``PreToolUse``-format output (``updatedInput``) so Claude receives the
-    answers and skips its own TUI picker.
+    httpx imports ``httpx._main`` inside ``try/except ImportError``, so a
+    placeholder without ``main`` gives it the fallback stub. The policy hook
+    never runs that client, and Claude Code waits on the hook's imports.
 
-    When ``permission_mode`` is anything other than ``"bypassPermissions"``
-    (including absent/unknown), this is a no-op: the ``PermissionRequest`` hook
-    will handle the call, and returning empty output here prevents a duplicate
-    elicitation from appearing.
-
-    :param argv: CLI argv after the ``ask-user-question`` subcommand,
-        e.g. ``["--bridge-dir", "/tmp/x"]``.
-    :returns: Process exit code. Returns ``0`` on any failure so Claude Code
-        falls back to its terminal TUI prompt rather than blocking.
+    :returns: None.
     """
-    from omnigent.native.native_policy_hook import policy_hook_reauth
-
-    args = _parse_permission_args(argv)
-    raw = sys.stdin.read()
-    try:
-        payload = json.loads(raw or "{}")
-    except json.JSONDecodeError as exc:
-        print(f"omnigent ask-user-question hook: malformed JSON: {exc}", file=sys.stderr)
-        return 0
-    if not isinstance(payload, dict):
-        print("omnigent ask-user-question hook: expected JSON object", file=sys.stderr)
-        return 0
-    # Only intercept in bypassPermissions mode. In any other mode the
-    # PermissionRequest hook fires independently and owns the elicitation;
-    # returning empty output here is "no opinion" so Claude's own flow
-    # continues unimpeded and we avoid surfacing the form twice.
-    if payload.get("permission_mode") != "bypassPermissions":
-        return 0
-    bridge_dir = Path(args.bridge_dir)
-    session_id = read_active_session_id(bridge_dir)
-    if not session_id:
-        print("omnigent ask-user-question hook: active session missing", file=sys.stderr)
-        return 0
-    config = read_permission_hook_config(bridge_dir)
-    ap_server_url = args.omnigent_server_url or config.get("ap_server_url")
-    if not isinstance(ap_server_url, str) or not ap_server_url:
-        print("omnigent ask-user-question hook: Omnigent server URL missing", file=sys.stderr)
-        return 0
-    headers = _parse_headers(args.omnigent_auth_headers_json)
-    if not headers:
-        raw_headers = config.get("ap_auth_headers")
-        if isinstance(raw_headers, dict):
-            headers = {str(key): str(value) for key, value in raw_headers.items()}
-    # Same as the permission-request hook: the elicitation parks in the pod-local
-    # registry on the session's tunnel replica, so key the POST from the
-    # runner-env host_id or an off-replica landing silently drops the prompt.
-    from omnigent.cli_auth import databricks_request_headers
-
-    headers.update(databricks_request_headers(ap_server_url))
-    url = (
-        f"{ap_server_url.rstrip('/')}/v1/sessions/"
-        f"{url_component(session_id)}/hooks/permission-request"
-    )
-    resp = _post_hook_with_reattach(
-        url,
-        headers,
-        payload,
-        "ask-user-question",
-        reauth=policy_hook_reauth(ap_server_url, headers),
-        wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
-    )
-    if resp is None or not resp.content:
-        return 0
-    # The Omnigent server returns a PermissionRequest-shaped response:
-    #   {"hookSpecificOutput": {"hookEventName": "PermissionRequest",
-    #                           "decision": {"behavior": "allow",
-    #                                        "updatedInput": {...}}}}
-    # Convert to PreToolUse format so Claude applies updatedInput:
-    #   {"hookSpecificOutput": {"hookEventName": "PreToolUse",
-    #                           "permissionDecision": "allow",
-    #                           "updatedInput": {...}}}
-    try:
-        body = resp.json()
-    except ValueError as exc:
-        print(f"omnigent ask-user-question hook: invalid JSON from AP: {exc}", file=sys.stderr)
-        return 0
-    decision = (
-        body.get("hookSpecificOutput", {}).get("decision", {}) if isinstance(body, dict) else {}
-    )
-    behavior = decision.get("behavior") if isinstance(decision, dict) else None
-    if behavior not in ("allow", "deny"):
-        # Unexpected shape — return empty output so Claude falls back to TUI.
-        return 0
-    pre_tool_use_output: dict[str, object] = {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": behavior,
-        },
-    }
-    updated_input = decision.get("updatedInput") if isinstance(decision, dict) else None
-    if isinstance(updated_input, dict):
-        pre_tool_use_output["hookSpecificOutput"]["updatedInput"] = updated_input  # type: ignore[index]
-    sys.stdout.write(json.dumps(pre_tool_use_output))
-    return 0
+    if "httpx" not in sys.modules:
+        sys.modules.setdefault("httpx._main", types.ModuleType("httpx._main"))
 
 
 def _main_evaluate_policy(argv: list[str]) -> int:
@@ -1091,6 +1052,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     :returns: Process exit code. Always ``0`` — blocking verdicts
         are expressed via the JSON output, not exit codes.
     """
+    _skip_httpx_cli_import()
     from omnigent.native.native_policy_hook import (
         evaluation_response_to_hook_output,
         fail_ask_hook_output,
@@ -1202,6 +1164,30 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--bridge-dir", required=True)
     parser.add_argument("--conversation-url")
     return parser.parse_args(argv)
+
+
+def _main_framework_context(argv: list[str]) -> int:
+    """Add pending framework context to one submitted prompt."""
+    args = _parse_evaluate_policy_args(argv)
+    sys.stdin.read()
+    path = Path(args.bridge_dir) / CLAUDE_FRAMEWORK_CONTEXT_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+        path.unlink(missing_ok=True)
+    except OSError:
+        return 0
+    if text:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": text,
+                    }
+                }
+            )
+        )
+    return 0
 
 
 def _parse_evaluate_policy_args(argv: list[str]) -> argparse.Namespace:
@@ -1438,5 +1424,35 @@ def _route_turn_post(
     return decoded if isinstance(decoded, dict) else None
 
 
+# Claude Code waits on these on every tool call and prompt.
+_FAST_EXIT_SUBCOMMANDS = frozenset({"evaluate-policy", "pre-tool-use"})
+
+
+def _exit_without_teardown(code: int) -> NoReturn:
+    """
+    Finalize as the interpreter would, then leave before module teardown.
+
+    Claude Code blocks on the policy hook until its process exits, and tearing
+    down the modules it imported costs tens of milliseconds on every tool call.
+    This runs the ``threading`` exit callbacks and joins non-daemon threads,
+    then runs the ``atexit`` callbacks, in the interpreter's own order (as
+    CPython 3.13's forked multiprocessing children do), so pending writes and
+    exit work still finish. Only object finalizers that run during module
+    teardown are skipped.
+
+    :param code: Process exit code, e.g. ``0``.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    threading._shutdown()  # type: ignore[attr-defined]  # private, as in multiprocessing
+    atexit._run_exitfuncs()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    if sys.argv[1:2] and sys.argv[1] in _FAST_EXIT_SUBCOMMANDS:
+        _exit_without_teardown(exit_code)
+    raise SystemExit(exit_code)

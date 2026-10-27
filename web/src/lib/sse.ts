@@ -1,3 +1,4 @@
+import { parseNativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_sse.py.
 //
 // Parses raw `text/event-stream` bytes into typed `StreamEvent`
@@ -8,6 +9,7 @@
 // reducer never seeing certain events, which the reducer's tests can't
 // catch — please add an SSE-parser test when you touch this.
 
+import { readSubagentActivity } from "./subagentActivity";
 import type {
   BrowserActionRequestEvent,
   ClientTaskCancel,
@@ -45,7 +47,6 @@ import type {
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
   SessionSupersededEvent,
-  SessionSkillsEvent,
   SessionViewer,
   SessionTerminalActivityEvent,
   SessionStatusEvent,
@@ -74,6 +75,7 @@ import type {
 import { NATIVE_TOOL_TYPES } from "./events";
 import { routingExtrasFromWire } from "./routingDecision";
 import type {
+  AgyPermission,
   BackgroundTaskInfo,
   CodexPersistMode,
   ErrorInfo,
@@ -412,7 +414,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     } satisfies ResponseCompleted;
   }
   if (eventType === "response.failed") {
-    return { type: "response_failed", response: parseResponse(data) } satisfies ResponseFailed;
+    return {
+      type: "response_failed",
+      response: parseResponse(data),
+      ...(typeof data.source === "string" ? { source: data.source } : {}),
+    } satisfies ResponseFailed;
   }
   if (eventType === "response.incomplete") {
     const resp = parseResponse(data);
@@ -765,6 +771,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // step — the snapshot re-seeds the indicator on the next load.
     if (
       stage !== "provisioning" &&
+      stage !== "action_required" &&
       stage !== "cloning" &&
       stage !== "starting" &&
       stage !== "connecting" &&
@@ -778,6 +785,8 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       stage,
       error: typeof data.error === "string" ? data.error : null,
+      provider: typeof data.provider === "string" ? data.provider : undefined,
+      details: typeof data.details === "string" ? data.details : null,
     } satisfies SessionSandboxStatusEvent;
   }
   if (eventType === "session.mcp_startup") {
@@ -945,16 +954,6 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       terminalId,
     } satisfies SessionTerminalActivityEvent;
   }
-  if (eventType === "session.skills") {
-    const conversationId = data.conversation_id;
-    if (typeof conversationId !== "string" || !conversationId) return null;
-    // Bare nudge — the runner's skills resolved. The store handler
-    // refetches the (now-warm) snapshot and applies its `skills`.
-    return {
-      type: "session_skills",
-      conversationId,
-    } satisfies SessionSkillsEvent;
-  }
   if (eventType === "session.model_options") {
     const conversationId = data.conversation_id;
     if (typeof conversationId !== "string" || !conversationId) return null;
@@ -985,6 +984,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       viewers,
     } satisfies SessionPresenceEvent;
+  }
+
+  if (eventType === "ui.open_file") {
+    if (typeof data.path !== "string" || !data.path) return null;
+    return { type: "ui_open_file", path: data.path };
   }
 
   // Embedded-browser action request: asks the desktop relay to run the agent's
@@ -1037,6 +1041,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // session to acceptEdits mode on accept).
     const allowAllEdits = p.allow_all_edits === true;
     const allowAutoMode = p.allow_auto_mode === true;
+    const permissionDirectories =
+      Array.isArray(p.permission_directories) &&
+      p.permission_directories.every(
+        (directory): directory is string => typeof directory === "string" && directory.length > 0,
+      )
+        ? p.permission_directories
+        : undefined;
     // claude-native non-edit tool prompts stamp this so the ApprovalCard
     // offers the persistent "don't ask again" button (installs a
     // session-scoped allow rule on accept). `tool` is the gated tool;
@@ -1054,6 +1065,24 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
               typeof (rememberScopeRaw as Record<string, unknown>).host === "string"
                 ? ((rememberScopeRaw as Record<string, unknown>).host as string)
                 : undefined,
+          }
+        : null;
+    // The agy permission mapper stamps the action description and, when agy's
+    // prompt offers an always-allow choice, the advertised persist pattern.
+    // Surface both so the card shows agy's full prompt, not a bare Approve/Reject.
+    const actionDescriptionRaw = p.action_description;
+    const alwaysAllowPatternRaw = p.always_allow_pattern;
+    const agyPermission: AgyPermission | null =
+      phase === "agy_permission"
+        ? {
+            actionDescription:
+              typeof actionDescriptionRaw === "string" && actionDescriptionRaw
+                ? actionDescriptionRaw
+                : null,
+            alwaysAllowPattern:
+              typeof alwaysAllowPatternRaw === "string" && alwaysAllowPatternRaw
+                ? alwaysAllowPatternRaw
+                : null,
           }
         : null;
     const codexMetaRaw = p["_meta"];
@@ -1075,6 +1104,9 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     ];
     return {
       type: "elicitation_request",
+      ...(p.native_delivery
+        ? { nativeDelivery: parseNativePermissionDelivery(p.native_delivery) }
+        : {}),
       elicitationId,
       targetSessionId:
         typeof targetSessionId === "string" && targetSessionId ? targetSessionId : null,
@@ -1113,8 +1145,10 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           : null,
       allowAllEdits,
       allowAutoMode,
+      permissionDirectories,
       rememberScope,
       codexPersistModes,
+      agyPermission,
     } satisfies ElicitationRequest;
   }
 
@@ -1241,15 +1275,13 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
   }
 
   if (itemType === "error") {
+    // Same parse as `response.error`, so a classified item's title / cause /
+    // remediation render live exactly as they do after a reload.
     return {
       type: "error",
       source: String(rec.source ?? ""),
       toolName: null,
-      error: {
-        code: String(rec.code ?? ""),
-        message: String(rec.message ?? ""),
-        ...(rec.level === "info" ? { level: "info" as const } : {}),
-      },
+      error: parseErrorInfo(rec),
       itemId,
       responseId,
     } satisfies ErrorEvent;
@@ -1305,6 +1337,16 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       itemId,
       responseId,
     } satisfies TerminalCommandEvent;
+  }
+
+  if (readSubagentActivity(rec)) {
+    return {
+      type: "native_tool_call",
+      toolType: "subagent_activity",
+      data: rec,
+      itemId,
+      responseId,
+    } satisfies NativeToolCall;
   }
 
   if (NATIVE_TOOL_TYPES.has(itemType)) {
